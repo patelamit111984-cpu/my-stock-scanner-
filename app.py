@@ -60,7 +60,7 @@ FO_STOCKS = [
 
 def get_tv_link(symbol):
     clean_symbol = symbol.replace(".NS", "")
-    return f"https://tradingview.com{clean_symbol}"
+    return f"https://tradingview.com{clean_symbol}&interval=5&theme=dark&style=1&timezone=Asia%2FKolkata&studies=%5B%22RSI%40tv-basicstudies%22%2C%22Volume%40tv-basicstudies%22%5D"
 def scan_all_strategies(stocks):
     orb_list, open_low_list, open_high_list = [], [], []
     vol_up_list, vol_down_list, ema_cross_list, bb_squeeze_list = [], [], [], []
