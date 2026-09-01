@@ -4,7 +4,11 @@ import pandas as pd
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title="Pro Terminal 180+ F&O & Nifty 50", layout="wide")
+st.set_page_config(
+    page_title="Pro Terminal 180+ F&O & Nifty 50", 
+    layout="wide"
+)
+
 st.title("🦅 My Ultimate F&O + Nifty 50 Multi-Strategy Trading Terminal")
 
 india_tz = pytz.timezone('Asia/Kolkata')
@@ -17,6 +21,7 @@ current_minute = now_india.minute
 current_day = now_india.weekday()
 
 market_closed = False
+
 if current_day >= 5:
     market_closed = True
 elif (current_hour < 9) or (current_hour == 9 and current_minute < 15):
@@ -60,10 +65,18 @@ FO_STOCKS = [
 
 def get_tv_link(symbol):
     clean_symbol = symbol.replace(".NS", "")
-    return f"https://tradingview.com{clean_symbol}&interval=5&theme=dark&style=1&timezone=Asia%2FKolkata&studies=%5B%22RSI%40tv-basicstudies%22%2C%22Volume%40tv-basicstudies%22%5D"
+    base_url = "https://tradingview.com"
+    params = f"?symbol=NSE%3A{clean_symbol}&interval=5&theme=dark&style=1&timezone=Asia%2FKolkata&studies=%5B%22RSI%40tv-basicstudies%22%2C%22Volume%40tv-basicstudies%22%5D"
+    return f"{base_url}{params}"
 def scan_all_strategies(stocks):
-    orb_list, open_low_list, open_high_list = [], [], []
-    vol_up_list, vol_down_list, ema_cross_list, bb_squeeze_list = [], [], [], []
+    orb_list = []
+    open_low_list = []
+    open_high_list = []
+    vol_up_list = []
+    vol_down_list = []
+    ema_cross_list = []
+    bb_squeeze_list = []
+    
     progress_text = st.empty()
     
     for idx, stock in enumerate(stocks):
@@ -72,14 +85,17 @@ def scan_all_strategies(stocks):
         try:
             data_5m = yf.download(stock, period=data_period, interval="5m", progress=False)
             data_1d = yf.download(stock, period="10d", interval="1d", progress=False)
+            
             if data_5m.empty or len(data_5m) < 21 or data_1d.empty or len(data_1d) < 6:
                 continue
+                
             data_5m.columns = [col if isinstance(col, tuple) else col for col in data_5m.columns]
             data_1d.columns = [col if isinstance(col, tuple) else col for col in data_1d.columns]
             
             last_date = data_5m.index[-1].date()
             day_data = data_5m[data_5m.index.date == last_date]
-            if day_data.empty: continue
+            if day_data.empty: 
+                continue
             
             current_price = float(day_data['Close'].iloc[-1])
             prev_price = float(day_data['Close'].iloc[-2]) if len(day_data) > 1 else current_price
@@ -116,6 +132,7 @@ def scan_all_strategies(stocks):
             day_data['EMA20'] = day_data['Close'].ewm(span=20, adjust=False).mean()
             current_ema = float(day_data['EMA20'].iloc[-1])
             prev_ema = float(day_data['EMA20'].iloc[-2]) if len(day_data) > 1 else current_ema
+            
             if prev_price <= prev_ema and current_price > current_ema:
                 ema_cross_list.append({"Stock": stock_name, "Signal": "🟢 Above 20 EMA", "Price": round(current_price,2), "EMA20": round(current_ema,2), "Chart": tv_url})
             elif prev_price >= prev_ema and current_price < current_ema:
@@ -125,17 +142,20 @@ def scan_all_strategies(stocks):
             day_data['STD'] = day_data['Close'].rolling(window=20).std()
             data_5m['Upper_BB'] = day_data['MA20_BB'] + (2 * day_data['STD'])
             data_5m['Lower_BB'] = day_data['MA20_BB'] - (2 * day_data['STD'])
+            
             if not data_5m['Upper_BB'].isna().iloc[-1]:
                 current_upper = float(data_5m['Upper_BB'].iloc[-1])
                 current_lower = float(data_5m['Lower_BB'].iloc[-1])
                 prev_upper = float(data_5m['Upper_BB'].iloc[-2]) if len(day_data) > 1 else current_upper
                 prev_lower = float(data_5m['Lower_BB'].iloc[-2]) if len(day_data) > 1 else current_lower
+                
                 if prev_price <= prev_upper and current_price > current_upper:
                     bb_squeeze_list.append({"Stock": stock_name, "Signal": "🟢 Upper Band Breakout", "Price": round(current_price,2), "Upper Band": round(current_upper,2), "Chart": tv_url})
                 elif prev_price >= prev_lower and current_price < current_lower:
                     bb_squeeze_list.append({"Stock": stock_name, "Signal": "🔴 Lower Band Breakdown", "Price": round(current_price,2), "Lower Band": round(current_lower,2), "Chart": tv_url})
         except Exception as e:
             pass
+            
     progress_text.empty()
     return (pd.DataFrame(orb_list), pd.DataFrame(open_low_list), pd.DataFrame(open_high_list), 
             pd.DataFrame(vol_up_list), pd.DataFrame(vol_down_list), pd.DataFrame(ema_cross_list), pd.DataFrame(bb_squeeze_list))
@@ -147,11 +167,13 @@ if st.button("🚀 Scan All Active F&O + Nifty 50 Market Now"):
             "⏱️ 15 Min ORB", "🚀 Open = Low (Bullish)", "📉 Open = High (Bearish)", 
             "🔊 Vol Breakout (Low-High)", "💥 Vol Breakdown (High-Low)", "📈 20 EMA Cross", "🔮 Bollinger Bands Squeeze"
         ])
+        
         def show_data(df, empty_msg):
             if not df.empty:
                 st.dataframe(df, use_container_width=True, column_config={"Chart": st.column_config.LinkColumn("TradingView Chart")})
             else:
                 st.info(empty_msg)
+                
         with tab1:
             st.subheader("15 Minute Opening Range Breakout / Breakdown")
             show_data(df_orb, "No breakout found in current session data.")
