@@ -30,7 +30,6 @@ else:
     st.success("🟢 STARTUP REMARK: Live Market is OPEN! Scanning in real-time.")
     data_period = "1d"
 
-# Nifty 50 Exact Stocks List
 NIFTY50_STOCKS = [
     'ADANIENT.NS', 'ADANIPORTS.NS', 'APOLLOHOSP.NS', 'ASIANPAINT.NS', 'AXISBANK.NS', 'BAJAJ-AUTO.NS', 
     'BAJFINANCE.NS', 'BAJAJFINSV.NS', 'BEL.NS', 'BPCL.NS', 'BHARTIARTL.NS', 'BRITANNIA.NS', 'CIPLA.NS', 
@@ -41,7 +40,6 @@ NIFTY50_STOCKS = [
     'TATAMOTORS.NS', 'TATASTEEL.NS', 'TECHM.NS', 'TITAN.NS', 'ULTRACEMCO.NS', 'WIPRO.NS', 'SHRIRAMFIN.NS'
 ]
 
-# Complete 180+ F&O Stocks List
 FO_STOCKS = [
     'AARTIIND.NS', 'ABB.NS', 'ABBOTINDIA.NS', 'ABCAPITAL.NS', 'ABFRL.NS', 'ACC.NS', 'ADANIENT.NS', 'ADANIPORTS.NS',
     'ADANIPOWER.NS', 'ALKEM.NS', 'AMBUJACEM.NS', 'APOLLOHOSP.NS', 'APOLLOTYRE.NS', 'ASHOKLEY.NS', 'ASIANPAINT.NS', 
@@ -75,7 +73,7 @@ def scan_all_strategies(stocks):
     
     for idx, stock in enumerate(stocks):
         if idx % 20 == 0:
-            progress_text.text(f"Scanning 180+ Market Momentum: {idx}/{len(stocks)} processed...")
+            progress_text.text(f"Scanning F&O Momentum: {idx}/{len(stocks)} processed...")
         try:
             data = yf.download(stock, period=data_period, interval="1d", progress=False)
             if data.empty or len(data) < 6: continue
@@ -119,9 +117,9 @@ def scan_all_strategies(stocks):
             data['Upper'] = data['SMA5'] + (1.5 * data['STD'])
             data['Lower'] = data['SMA5'] - (1.5 * data['STD'])
             if current_price > float(data['Upper'].iloc[-1]):
-                bb_squeeze_list.append({"Stock": stock_name, "Signal": "🟢 Upper Band Breakout", "Price": round(current_price,2), "Upper": round(data['Upper'].iloc[-1],2)})
+                bb_squeeze_list.append({"Stock": stock_name, "Signal": "🟢 Upper Band Break", "Price": round(current_price,2), "Upper": round(data['Upper'].iloc[-1],2)})
             elif current_price < float(data['Lower'].iloc[-1]):
-                bb_squeeze_list.append({"Stock": stock_name, "Signal": "🔴 Lower Band Breakdown", "Price": round(current_price,2), "Lower": round(data['Lower'].iloc[-1],2)})
+                bb_squeeze_list.append({"Stock": stock_name, "Signal": "🔴 Lower Band Break", "Price": round(current_price,2), "Lower": round(data['Lower'].iloc[-1],2)})
         except: pass
     progress_text.empty()
     return (pd.DataFrame(orb_list), pd.DataFrame(open_low_list), pd.DataFrame(open_high_list), 
@@ -132,8 +130,8 @@ def get_nifty50_dashboard(stocks):
     advances, declines = 0, 0
     for stock in stocks:
         try:
-            res = yf.download(stock, period="2d", interval="1d", progress=False)
-            if res.empty: continue
+            res = yf.download(stock, period="5d", interval="1d", progress=False)
+            if res.empty or len(res) < 2: continue
             if isinstance(res.columns, pd.MultiIndex): res.columns = res.columns.get_level_values(0)
             
             op = round(float(res['Open'].iloc[-1]), 2)
@@ -172,11 +170,13 @@ if st.button("🚀 Run Ultimate Terminal Scan Now"):
         with tab8:
             st.subheader("Nifty 50 Real-Time Heatmap Sheet")
             if not df_nifty.empty:
-                # Custom Style to Color Code Positive in Green and Negative in Red
+                # --- 🔥 FIXED FUNCTION FROM .applymap TO .map FOR PANDAS 2.0+ ---
                 def color_change(val):
-                    color = 'green' if val >= 0 else 'red'
-                    return f'color: {color}; font-weight: bold;'
-                st.dataframe(df_nifty.style.applymap(color_change, subset=['Change %']), use_container_width=True)
+                    if isinstance(val, (int, float)):
+                        color = 'green' if val >= 0 else 'red'
+                        return f'color: {color}; font-weight: bold;'
+                    return ''
+                st.dataframe(df_nifty.style.map(color_change, subset=['Change %']), use_container_width=True)
                 
                 st.markdown("---")
                 st.subheader("📊 Advance / Decline Ratio")
