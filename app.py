@@ -1,7 +1,10 @@
+import re
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 from datetime import time as dtime
 
 try:
@@ -10,9 +13,10 @@ except Exception:
     st_autorefresh = None
 
 try:
-    from nsepython import fnolist
+    from nsepython import fnolist, nse_optionchain_scrapper
 except Exception:
     fnolist = None
+    nse_optionchain_scrapper = None
 
 # =============================================================================
 # PAGE
@@ -35,6 +39,18 @@ st.markdown(
         border-radius: 10px;
         padding: 10px;
     }
+    .live-strip {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 12px 0;}
+    .live-card {border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:10px 12px;min-height:78px;}
+    .live-title {font-size:12px;opacity:.75;}
+    .live-value {font-size:23px;font-weight:700;line-height:1.15;}
+    .live-change {font-size:13px;font-weight:700;}
+    .pos {color:#00a65a;} .neg {color:#d62728;} .neu {color:#888;}
+    .sector-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;}
+    .sector-card {border-radius:12px;padding:12px;border:1px solid rgba(128,128,128,.22);min-height:105px;}
+    .sector-name {font-size:15px;font-weight:800;}
+    .sector-pct {font-size:22px;font-weight:800;margin:2px 0 6px;}
+    .sector-stocks {font-size:12px;opacity:.90;}
+    @media (max-width:900px){.live-strip,.sector-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -80,6 +96,20 @@ FO_FALLBACK = list(dict.fromkeys(NIFTY50_FALLBACK + [
     "TORNTPOWER","TVSMOTOR","UBL","UNIONBANK","UNITDSPR","UPL","VBL",
     "VEDL","VOLTAS","YESBANK","ZYDUSLIFE"
 ]))
+
+SECTOR_MAP = {
+    "HDFCBANK":"BANK","ICICIBANK":"BANK","SBIN":"BANK","AXISBANK":"BANK","KOTAKBANK":"BANK","INDUSINDBK":"BANK",
+    "INFY":"IT","TCS":"IT","HCLTECH":"IT","TECHM":"IT","WIPRO":"IT",
+    "MARUTI":"AUTO","M&M":"AUTO","TATAMOTORS":"AUTO","EICHERMOT":"AUTO","HEROMOTOCO":"AUTO","BAJAJ-AUTO":"AUTO",
+    "SUNPHARMA":"PHARMA","DRREDDY":"PHARMA","CIPLA":"PHARMA","APOLLOHOSP":"HEALTHCARE",
+    "ITC":"FMCG","HINDUNILVR":"FMCG","NESTLEIND":"FMCG","TATACONSUM":"FMCG",
+    "TATASTEEL":"METAL","HINDALCO":"METAL","JSWSTEEL":"METAL","COALINDIA":"METAL",
+    "RELIANCE":"ENERGY","ONGC":"ENERGY","NTPC":"POWER","POWERGRID":"POWER",
+    "LT":"INFRA","ADANIPORTS":"INFRA","ADANIENT":"DIVERSIFIED","BEL":"DEFENCE",
+    "BAJFINANCE":"FINANCIAL","BAJAJFINSV":"FINANCIAL","JIOFIN":"FINANCIAL","SHRIRAMFIN":"FINANCIAL",
+    "HDFCLIFE":"INSURANCE","SBILIFE":"INSURANCE","GRASIM":"CEMENT","ULTRACEMCO":"CEMENT",
+    "ASIANPAINT":"CONSUMER","TRENT":"RETAIL","BHARTIARTL":"TELECOM","ETERNAL":"INTERNET","BAJAJHLDNG":"FINANCIAL"
+}
 
 # =============================================================================
 # SYMBOLS / MARKET STATUS
@@ -185,6 +215,69 @@ def fetch_intraday(symbols):
     return result
 
 # =============================================================================
+# LIVE TOP STRIP — ADD-ON ONLY
+# =============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def yahoo_live_quote(ticker):
+    try:
+        intr = yf.download(ticker, period="5d", interval="5m", auto_adjust=False, progress=False, threads=False)
+        daily = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if intr is None or intr.empty:
+            return None
+        c = intr["Close"]
+        if isinstance(c, pd.DataFrame): c = c.iloc[:,0]
+        price = float(c.dropna().iloc[-1])
+        prev = np.nan
+        if daily is not None and not daily.empty:
+            dc = daily["Close"]
+            if isinstance(dc, pd.DataFrame): dc = dc.iloc[:,0]
+            vals = dc.dropna().astype(float).tolist()
+            if len(vals) >= 2: prev = vals[-2]
+            elif len(vals) == 1: prev = vals[-1]
+        change = price-prev if pd.notna(prev) else np.nan
+        pct = change/prev*100 if pd.notna(prev) and prev else np.nan
+        return {"price":price,"change":change,"pct":pct}
+    except Exception:
+        return None
+
+@st.cache_data(ttl=60, show_spinner=False)
+def gift_nifty_live():
+    # Best-effort third-party public quote. If blocked, UI shows N/A.
+    try:
+        url = "https://giftcitynifty.com/gift-nifty-intraday-price-data/"
+        r = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        text = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)
+        m = re.search(r"Gift Nifty Live price is\s*([\d,]+(?:\.\d+)?)\s*(up|down)\s*by\s*([\d,]+(?:\.\d+)?)", text, re.I)
+        if not m: return None
+        price = float(m.group(1).replace(",",""))
+        sign = 1 if m.group(2).lower()=="up" else -1
+        change = sign*float(m.group(3).replace(",",""))
+        prev = price-change
+        pct = change/prev*100 if prev else np.nan
+        return {"price":price,"change":change,"pct":pct}
+    except Exception:
+        return None
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_nifty_pcr():
+    # No fake/synthetic PCR: only actual option-chain OI when available.
+    if nse_optionchain_scrapper is None:
+        return None
+    try:
+        oc = nse_optionchain_scrapper("NIFTY")
+        data = oc.get("records",{}).get("data",[]) if isinstance(oc,dict) else []
+        ce_oi = pe_oi = 0.0
+        for item in data:
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
+            ce_oi += float(ce.get("openInterest") or 0)
+            pe_oi += float(pe.get("openInterest") or 0)
+        return pe_oi/ce_oi if ce_oi > 0 else None
+    except Exception:
+        return None
+
+# =============================================================================
 # INDICATORS
 # =============================================================================
 def enrich(df):
@@ -238,6 +331,33 @@ def cross_down(a, b):
         and a.iloc[-2] >= b.iloc[-2]
         and a.iloc[-1] < b.iloc[-1]
     )
+
+def rvol_score(rvol):
+    if pd.isna(rvol): return "N/A"
+    if rvol >= 5: return "🔥 Explosive"
+    if rvol >= 3: return "🟢 Strong"
+    if rvol >= 2: return "🟡 Good"
+    if rvol >= 1.5: return "⚪ Watch"
+    return "Low"
+
+def resample_ohlcv(df, rule):
+    return (df.resample(rule, origin="start_day", offset="15min")
+              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+              .dropna(subset=["close"]))
+
+def tf_bias(df, rule=None):
+    x = df if rule is None else resample_ohlcv(df, rule)
+    if len(x) < 20: return "N/A"
+    e = x["close"].ewm(span=20, adjust=False).mean()
+    c,ev = float(x["close"].iloc[-1]), float(e.iloc[-1])
+    return "BULLISH" if c > ev else ("BEARISH" if c < ev else "NEUTRAL")
+
+def mtf_alignment(raw):
+    b5,b15,b60 = tf_bias(raw), tf_bias(raw,"15min"), tf_bias(raw,"60min")
+    if all(v=="BULLISH" for v in [b5,b15,b60]): align="🟢 BULLISH"
+    elif all(v=="BEARISH" for v in [b5,b15,b60]): align="🔴 BEARISH"
+    else: align="⚠️ MIXED"
+    return b5,b15,b60,align
 
 # =============================================================================
 # ONE-STOCK SCAN
@@ -345,6 +465,29 @@ def build_row(symbol, raw, high_vol_mult, strong_move_pct,
     bb_bull = prior_squeeze and cross_up(x["close"], x["bb_upper"])
     bb_bear = prior_squeeze and cross_down(x["close"], x["bb_lower"])
 
+    # NEW add-ons. Old formulas above are untouched.
+    vwap_bias = "N/A" if pd.isna(vwap) else ("BULLISH" if c > vwap else ("BEARISH" if c < vwap else "NEUTRAL"))
+    rv_score = rvol_score(rvol)
+    b5,b15,b60,alignment = mtf_alignment(raw)
+
+    bull_score = bear_score = 0
+    if orb == "ORB UP": bull_score += 20
+    if orb == "ORB DOWN": bear_score += 20
+    if pd.notna(rvol) and rvol >= 2:
+        if c >= o: bull_score += 20
+        else: bear_score += 20
+    if ema_bull: bull_score += 15
+    if ema_bear: bear_score += 15
+    if bb_bull: bull_score += 15
+    if bb_bear: bear_score += 15
+    if vwap_bias == "BULLISH": bull_score += 10
+    if vwap_bias == "BEARISH": bear_score += 10
+    if alignment == "🟢 BULLISH": bull_score += 20
+    if alignment == "🔴 BEARISH": bear_score += 20
+    scanner_score = max(bull_score,bear_score)
+    score_bias = "🟢 BULLISH" if bull_score > bear_score else ("🔴 BEARISH" if bear_score > bull_score else "⚪ NEUTRAL")
+    trend_strength = ((c/ema20)-1)*100 if pd.notna(ema20) and ema20 else np.nan
+
     return {
         "Symbol": symbol,
         "Session": str(day.index[-1].date()),
@@ -356,8 +499,10 @@ def build_row(symbol, raw, high_vol_mult, strong_move_pct,
         "Change %": change_pct,
         "From Open %": move_from_open,
         "RVOL": rvol,
+        "RVOL Score": rv_score,
         "EMA20": ema20,
         "VWAP": vwap,
+        "VWAP Bias": vwap_bias,
         "ORB High": orb_high,
         "ORB Low": orb_low,
         "ORB": orb,
@@ -368,6 +513,14 @@ def build_row(symbol, raw, high_vol_mult, strong_move_pct,
         "EMA Bear": ema_bear,
         "BB Bull": bb_bull,
         "BB Bear": bb_bear,
+        "5m": b5,
+        "15m": b15,
+        "1H": b60,
+        "MTF Alignment": alignment,
+        "Scanner Score": scanner_score,
+        "Score Bias": score_bias,
+        "Trend Strength %": trend_strength,
+        "Session Volume": float(day["volume"].sum()),
     }
 
 def scan_universe(symbols, data_map, high_vol_mult, strong_move_pct,
@@ -400,6 +553,41 @@ def scan_universe(symbols, data_map, high_vol_mult, strong_move_pct,
     return pd.DataFrame(rows)
 
 # =============================================================================
+# MARKET STRENGTH LAYER — TRIN + PCR + A/D + NIFTY BREADTH
+# =============================================================================
+def market_strength_layer(nifty_df):
+    if nifty_df.empty:
+        return {"adv":0,"dec":0,"unch":0,"ad_ratio":np.nan,"breadth_pct":np.nan,"trin":np.nan,"pcr":None,"label":"N/A"}
+    adv_df=nifty_df[nifty_df["Change %"]>0]; dec_df=nifty_df[nifty_df["Change %"]<0]
+    adv,dec=len(adv_df),len(dec_df); unch=int((nifty_df["Change %"]==0).sum())
+    ad_ratio=np.inf if dec==0 and adv>0 else (adv/dec if dec>0 else np.nan)
+    breadth_pct=adv/len(nifty_df)*100 if len(nifty_df) else np.nan
+    adv_vol=float(adv_df["Session Volume"].sum()) if not adv_df.empty else 0.0
+    dec_vol=float(dec_df["Session Volume"].sum()) if not dec_df.empty else 0.0
+    trin=np.nan
+    if adv>0 and dec>0 and adv_vol>0 and dec_vol>0:
+        trin=(adv/dec)/(adv_vol/dec_vol)
+    pcr=get_nifty_pcr()
+    score=0
+    if pd.notna(breadth_pct): score += 1 if breadth_pct>=60 else (-1 if breadth_pct<=40 else 0)
+    if pd.notna(ad_ratio): score += 1 if ad_ratio>=1.2 else (-1 if ad_ratio<=0.8 else 0)
+    if pd.notna(trin): score += 1 if trin<=0.90 else (-1 if trin>=1.10 else 0)
+    if pcr is not None: score += 1 if pcr>=1.10 else (-1 if pcr<=0.80 else 0)
+    label = "STRONG BULLISH" if score>=3 else ("BULLISH" if score>=1 else ("STRONG BEARISH" if score<=-3 else ("BEARISH" if score<=-1 else "NEUTRAL")))
+    return {"adv":adv,"dec":dec,"unch":unch,"ad_ratio":ad_ratio,"breadth_pct":breadth_pct,"trin":trin,"pcr":pcr,"label":label}
+
+def fmt_num(v): return "N/A" if v is None or pd.isna(v) else f"{v:,.2f}"
+def fmt_pct(v): return "N/A" if v is None or pd.isna(v) else f"{v:+.2f}%"
+def live_card(title, quote=None, text=None):
+    if text is not None:
+        cls="pos" if "BULL" in text else ("neg" if "BEAR" in text else "neu")
+        return f'<div class="live-card"><div class="live-title">{title}</div><div class="live-value {cls}">{text}</div></div>'
+    if quote is None:
+        return f'<div class="live-card"><div class="live-title">{title}</div><div class="live-value neu">N/A</div><div class="live-change neu">feed unavailable</div></div>'
+    pct=quote.get("pct",np.nan); cls="pos" if pd.notna(pct) and pct>0 else ("neg" if pd.notna(pct) and pct<0 else "neu")
+    return f'<div class="live-card"><div class="live-title">{title}</div><div class="live-value {cls}">{fmt_num(quote.get("price"))}</div><div class="live-change {cls}">{fmt_num(quote.get("change"))} &nbsp; {fmt_pct(pct)}</div></div>'
+
+# =============================================================================
 # TABLE HELPERS
 # =============================================================================
 def prepare_table(df, sort_by=None, ascending=False):
@@ -414,7 +602,7 @@ def prepare_table(df, sort_by=None, ascending=False):
     numeric_cols = [
         "Open","High","Low","Close","Prev Close",
         "Change %","From Open %","RVOL","EMA20","VWAP",
-        "ORB High","ORB Low"
+        "ORB High","ORB Low","Scanner Score","Trend Strength %"
     ]
 
     for col in numeric_cols:
@@ -435,17 +623,26 @@ def show_table(df, columns=None, sort_by=None, ascending=False, height=610):
 
     x = prepare_table(x, sort_by, ascending)
 
-    st.dataframe(
-        x,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-    )
+    def paint(v):
+        sv=str(v)
+        if sv=="ORB UP" or "BULLISH" in sv: return "background-color:rgba(0,180,90,.16);color:#008f4c;font-weight:700"
+        if sv=="ORB DOWN" or "BEARISH" in sv: return "background-color:rgba(220,60,60,.16);color:#c62828;font-weight:700"
+        if "Explosive" in sv: return "background-color:rgba(255,90,0,.18);font-weight:800"
+        if "Strong" in sv: return "background-color:rgba(0,180,90,.13);font-weight:700"
+        if "Good" in sv: return "background-color:rgba(230,190,0,.17);font-weight:700"
+        return ""
+    styled=x.style
+    for col in ["ORB","VWAP Bias","Open Bias","MTF Alignment","Score Bias","State","RVOL Score"]:
+        if col in x.columns: styled=styled.map(paint, subset=[col])
+    for col in ["Change %","From Open %","Trend Strength %"]:
+        if col in x.columns:
+            styled=styled.map(lambda v: "color:#008f4c;font-weight:700" if pd.notna(v) and float(v)>0 else ("color:#c62828;font-weight:700" if pd.notna(v) and float(v)<0 else ""), subset=[col])
+    st.dataframe(styled,use_container_width=True,hide_index=True,height=height)
 
 # =============================================================================
 # SIDEBAR
 # =============================================================================
-st.title("📈 NSE Fast Scanner — 8 Tabs")
+st.title("📈 NSE Fast Scanner — 10 Tabs")
 
 with st.sidebar:
     st.header("Scanner Settings")
@@ -497,6 +694,11 @@ with st.sidebar:
         step=0.05,
     )
 
+    nifty_fut_ticker = st.text_input(
+        "Yahoo NIFTY Future ticker", value="NIFTY=F",
+        help="If unavailable in your Yahoo region, card shows N/A. No fake fallback."
+    )
+
     if st.button("Refresh Now", use_container_width=True):
         st.cache_data.clear()
 
@@ -539,6 +741,27 @@ nifty_df = scan_universe(
     squeeze_factor,
 )
 
+strength = market_strength_layer(nifty_df)
+nifty_quote = yahoo_live_quote("^NSEI")
+fut_quote = yahoo_live_quote(nifty_fut_ticker.strip()) if nifty_fut_ticker.strip() else None
+gift_quote = gift_nifty_live()
+
+st.markdown(
+    '<div class="live-strip">'
+    + live_card("MARKET STRENGTH", text=strength["label"])
+    + live_card("NIFTY 50", quote=nifty_quote)
+    + live_card("NIFTY FUTURE", quote=fut_quote)
+    + live_card("GIFT NIFTY*", quote=gift_quote)
+    + '</div>',
+    unsafe_allow_html=True,
+)
+
+pcr_txt = "N/A" if strength["pcr"] is None else f'{strength["pcr"]:.2f}'
+trin_txt = "N/A" if pd.isna(strength["trin"]) else f'{strength["trin"]:.2f}'
+ad_txt = "∞" if np.isinf(strength["ad_ratio"]) else ("N/A" if pd.isna(strength["ad_ratio"]) else f'{strength["ad_ratio"]:.2f}')
+breadth_txt = "N/A" if pd.isna(strength["breadth_pct"]) else f'{strength["breadth_pct"]:.1f}%'
+st.caption(f'Market Strength Layer → TRIN: {trin_txt} | PCR: {pcr_txt} | A/D: {ad_txt} | NIFTY Breadth: {breadth_txt} | Adv {strength["adv"]} / Dec {strength["dec"]}')
+
 # =============================================================================
 # TOP STATUS
 # =============================================================================
@@ -573,6 +796,8 @@ tabs = st.tabs([
     "6️⃣ EMA20 + Volume",
     "7️⃣ BB Squeeze",
     "8️⃣ NIFTY50 Breadth",
+    "9️⃣ MTF + Score",
+    "🔟 Sector Heatmap",
 ])
 
 # -----------------------------------------------------------------------------
@@ -588,7 +813,7 @@ with tabs[0]:
 
     show_table(
         x,
-        ["Symbol","Session","ORB","Close","ORB High","ORB Low","Change %","RVOL"],
+        ["Symbol","Session","ORB","Close","ORB High","ORB Low","Change %","RVOL","RVOL Score","VWAP","VWAP Bias"],
         "RVOL",
         False,
     )
@@ -745,84 +970,56 @@ with tabs[6]:
 # TAB 8
 # -----------------------------------------------------------------------------
 with tabs[7]:
-    st.subheader("NIFTY 50 — OHLC + Bullish/Bearish + Advance/Decline")
-
+    st.subheader("NIFTY 50 — OHLC + Breadth + Trend Strength")
     if nifty_df.empty:
         st.info("NIFTY50 data abhi load nahi hua.")
     else:
-        breadth = nifty_df[
-            ["Symbol","Session","Open","High","Low","Close","Prev Close","Change %"]
-        ].copy()
+        breadth=nifty_df[["Symbol","Session","Open","High","Low","Close","Prev Close","Change %","Trend Strength %"]].copy()
+        breadth["State"]=np.where(breadth["Change %"]>0,"BULLISH",np.where(breadth["Change %"]<0,"BEARISH","UNCHANGED"))
+        b1,b2,b3,b4=st.columns(4)
+        b1.metric("Advances",strength["adv"]); b2.metric("Declines",strength["dec"]); b3.metric("TRIN",trin_txt); b4.metric("A/D Ratio",ad_txt)
+        st.markdown(f'### Market Breadth: **{strength["label"]}**')
+        show_table(breadth,["Symbol","Session","State","Open","High","Low","Close","Prev Close","Change %","Trend Strength %"],"Change %",False,720)
 
-        breadth["State"] = np.where(
-            breadth["Change %"] > 0,
-            "BULLISH",
-            np.where(
-                breadth["Change %"] < 0,
-                "BEARISH",
-                "UNCHANGED"
-            ),
-        )
+# -----------------------------------------------------------------------------
+# TAB 9
+# -----------------------------------------------------------------------------
+with tabs[8]:
+    st.subheader("MTF Alignment + Scanner Score Engine")
+    st.caption("5m / 15m / 1H alignment. Score 0–100. Old scanner signals unchanged.")
+    if fo_df.empty:
+        st.info("Data unavailable.")
+    else:
+        x=fo_df[["Symbol","Session","5m","15m","1H","MTF Alignment","Scanner Score","Score Bias","RVOL","RVOL Score","VWAP Bias","ORB","Change %"]].copy()
+        show_table(x,None,"Scanner Score",False,720)
 
-        advances = int((breadth["Change %"] > 0).sum())
-        declines = int((breadth["Change %"] < 0).sum())
-        unchanged = int((breadth["Change %"] == 0).sum())
-
-        ad_ratio = np.inf if declines == 0 else advances / declines
-
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Advances", advances)
-        b2.metric("Declines", declines)
-        b3.metric("Unchanged", unchanged)
-        b4.metric(
-            "A/D Ratio",
-            "∞" if np.isinf(ad_ratio) else f"{ad_ratio:.2f}"
-        )
-
-        if np.isinf(ad_ratio) or ad_ratio >= 2:
-            breadth_text = "STRONG BULLISH"
-        elif ad_ratio > 1:
-            breadth_text = "BULLISH"
-        elif ad_ratio == 1:
-            breadth_text = "NEUTRAL"
-        elif ad_ratio >= 0.5:
-            breadth_text = "BEARISH"
-        else:
-            breadth_text = "STRONG BEARISH"
-
-        st.markdown(f"### Market Breadth: **{breadth_text}**")
-
-        breadth = prepare_table(
-            breadth.sort_values("Change %", ascending=False)
-        )
-
-        def row_colour(row):
-            val = row.get("Change %", np.nan)
-
-            if pd.isna(val):
-                return [""] * len(row)
-
-            if val > 0:
-                return ["background-color: rgba(0,180,90,0.16)"] * len(row)
-
-            if val < 0:
-                return ["background-color: rgba(220,60,60,0.16)"] * len(row)
-
-            return [""] * len(row)
-
-        st.dataframe(
-            breadth.style.apply(row_colour, axis=1),
-            use_container_width=True,
-            hide_index=True,
-            height=720,
-        )
+# -----------------------------------------------------------------------------
+# TAB 10
+# -----------------------------------------------------------------------------
+with tabs[9]:
+    st.subheader("Sector Heatmap — NIFTY 50")
+    st.caption("Sector % = simple average Change % of loaded members. Two stocks = top 2 movers by absolute % in that sector.")
+    if nifty_df.empty:
+        st.info("NIFTY50 data unavailable.")
+    else:
+        sec=nifty_df[["Symbol","Change %"]].copy(); sec["Sector"]=sec["Symbol"].map(SECTOR_MAP).fillna("OTHER")
+        cards=[]
+        for sector,grp in sec.groupby("Sector"):
+            avg=float(grp["Change %"].mean())
+            movers=grp.assign(abs_move=grp["Change %"].abs()).sort_values("abs_move",ascending=False).head(2)
+            stocks=" | ".join(f'{r["Symbol"]} {r["Change %"]:+.2f}%' for _,r in movers.iterrows())
+            if avg>0: bg,cls="rgba(0,180,90,.16)","pos"
+            elif avg<0: bg,cls="rgba(220,60,60,.16)","neg"
+            else: bg,cls="rgba(150,150,150,.10)","neu"
+            cards.append(f'<div class="sector-card" style="background:{bg}"><div class="sector-name">{sector}</div><div class="sector-pct {cls}">{avg:+.2f}%</div><div class="sector-stocks">{stocks}</div></div>')
+        st.markdown('<div class="sector-grid">'+''.join(cards)+'</div>',unsafe_allow_html=True)
 
 # =============================================================================
 # FOOTER
 # =============================================================================
 st.caption(
-    "Free data layer: Yahoo Finance (yfinance). It is useful for a free scanner, "
-    "but it is not an official guaranteed real-time NSE exchange feed. "
-    "Later, broker/vendor WebSocket can replace only the fetch layer without "
-    "changing these scanner formulas."
+    "Free stock/NIFTY data layer: Yahoo Finance (may be delayed). "
+    "GIFT NIFTY is best-effort from a third-party public page and may show N/A if blocked. "
+    "PCR is shown only when actual NSE option-chain OI is available through nsepython; no synthetic PCR is invented. "
+    "Old scanner formulas are preserved; new modules are add-ons."
 )
