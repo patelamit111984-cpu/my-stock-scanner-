@@ -639,10 +639,520 @@ def show_table(df, columns=None, sort_by=None, ascending=False, height=610):
             styled=styled.map(lambda v: "color:#008f4c;font-weight:700" if pd.notna(v) and float(v)>0 else ("color:#c62828;font-weight:700" if pd.notna(v) and float(v)<0 else ""), subset=[col])
     st.dataframe(styled,use_container_width=True,hide_index=True,height=height)
 
+
+# =============================================================================
+# TAB 11 + TAB 12 ADD-ON HELPERS
+# Existing Tabs 1-10 formulas above are intentionally untouched.
+# =============================================================================
+
+# NIFTY 50 top-weight fallback snapshot from NSE Indices factsheet dated 29-May-2026.
+# It is used only if no newer weight source is available inside this free scanner.
+NIFTY_TOP10_WEIGHT_SNAPSHOT = {
+    "HDFCBANK": 10.56,
+    "ICICIBANK": 8.32,
+    "RELIANCE": 8.27,
+    "BHARTIARTL": 5.20,
+    "LT": 4.43,
+    "INFY": 3.77,
+    "SBIN": 3.71,
+    "AXISBANK": 3.42,
+    "KOTAKBANK": 2.62,
+    "ITC": 2.56,
+}
+
+
+def _safe_float(v, default=np.nan):
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _daily_ohlcv_from_intraday(raw):
+    """Build daily OHLCV from the same existing intraday source."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    x = raw.copy()
+    x["session_date"] = x.index.date
+    d = x.groupby("session_date").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    return d.dropna(subset=["close"])
+
+
+def _atr14_from_intraday(raw):
+    d = _daily_ohlcv_from_intraday(raw)
+    if d.empty:
+        return np.nan
+    prev_close = d["close"].shift(1)
+    tr = pd.concat([
+        d["high"] - d["low"],
+        (d["high"] - prev_close).abs(),
+        (d["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    if len(tr.dropna()) < 2:
+        return np.nan
+    return float(tr.rolling(14, min_periods=2).mean().iloc[-1])
+
+
+def _previous_day_levels(raw):
+    """Previous completed session CPR + classic Fibonacci pivot references."""
+    d = _daily_ohlcv_from_intraday(raw)
+    if len(d) < 2:
+        return None
+    prev = d.iloc[-2]
+    ph, pl, pc = float(prev["high"]), float(prev["low"]), float(prev["close"])
+
+    pivot = (ph + pl + pc) / 3.0
+    bc = (ph + pl) / 2.0
+    tc = (2.0 * pivot) - bc
+    cpr_low, cpr_high = min(bc, tc), max(bc, tc)
+
+    prange = ph - pl
+    fib_r1 = pivot + 0.382 * prange
+    fib_s1 = pivot - 0.382 * prange
+
+    return {
+        "pivot": pivot,
+        "cpr_low": cpr_low,
+        "cpr_high": cpr_high,
+        "fib_r1": fib_r1,
+        "fib_s1": fib_s1,
+    }
+
+
+def _approx_volume_profile(day, bins=24):
+    """
+    Approximate intraday volume key levels using 5m bar typical-price volume.
+    This is deliberately labelled Approx VP, not true tick-by-price Volume Profile.
+    """
+    if day is None or day.empty:
+        return {"poc": np.nan, "vah": np.nan, "val": np.nan}
+
+    typical = ((day["high"] + day["low"] + day["close"]) / 3.0).astype(float)
+    vol = day["volume"].fillna(0).astype(float)
+    lo, hi = float(typical.min()), float(typical.max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo or float(vol.sum()) <= 0:
+        return {"poc": np.nan, "vah": np.nan, "val": np.nan}
+
+    edges = np.linspace(lo, hi, int(max(8, bins)) + 1)
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    bucket = np.zeros(len(mids), dtype=float)
+    idx = np.clip(np.digitize(typical.to_numpy(), edges) - 1, 0, len(mids) - 1)
+    for i, vv in zip(idx, vol.to_numpy()):
+        bucket[int(i)] += float(vv)
+
+    total = float(bucket.sum())
+    if total <= 0:
+        return {"poc": np.nan, "vah": np.nan, "val": np.nan}
+
+    poc_i = int(np.argmax(bucket))
+    order = np.argsort(bucket)[::-1]
+    selected = []
+    cum = 0.0
+    for i in order:
+        selected.append(int(i))
+        cum += float(bucket[i])
+        if cum / total >= 0.70:
+            break
+
+    return {
+        "poc": float(mids[poc_i]),
+        "vah": float(mids[max(selected)]),
+        "val": float(mids[min(selected)]),
+    }
+
+
+def build_confluence_row(symbol, raw):
+    """Tab 11 row. Requires first 15-minute range to be available."""
+    if raw is None or raw.empty:
+        return None
+
+    x = enrich(raw)
+    day = latest_session(x)
+    if day.empty:
+        return None
+
+    # First 15m = 09:15-09:29 from existing 5m bars.
+    first_15m = day.between_time("09:15", "09:29")
+    if first_15m.empty:
+        first_15m = day.iloc[:3]
+    if first_15m.empty:
+        return None
+
+    c = float(day["close"].iloc[-1])
+    o = float(day["open"].iloc[0])
+    orb_high = float(first_15m["high"].max())
+    orb_low = float(first_15m["low"].min())
+    vwap = _safe_float(day["vwap"].iloc[-1])
+    atr = _atr14_from_intraday(raw)
+    levels = _previous_day_levels(raw)
+    vp = _approx_volume_profile(day)
+    if levels is None:
+        return None
+
+    cpr_low, cpr_high = levels["cpr_low"], levels["cpr_high"]
+    cpr_mid = (cpr_low + cpr_high) / 2.0
+
+    if c > cpr_high:
+        cpr_state = "ABOVE CPR"
+    elif c < cpr_low:
+        cpr_state = "BELOW CPR"
+    else:
+        cpr_state = "INSIDE CPR"
+
+    cpr_dist_pct = ((c - cpr_mid) / cpr_mid * 100.0) if cpr_mid else np.nan
+    cpr_dist_atr = abs(c - cpr_mid) / atr if pd.notna(atr) and atr > 0 else np.nan
+    elastic = "RETEST WATCH" if pd.notna(cpr_dist_atr) and cpr_dist_atr > 1.0 else "NORMAL"
+
+    if c > levels["fib_r1"]:
+        fib_state = "ABOVE R1"
+    elif c < levels["fib_s1"]:
+        fib_state = "BELOW S1"
+    else:
+        fib_state = "R1/S1 INSIDE"
+
+    atr_move = abs(c - o)
+    atr_used_pct = (atr_move / atr * 100.0) if pd.notna(atr) and atr > 0 else np.nan
+    atr_space_pct = max(0.0, 100.0 - atr_used_pct) if pd.notna(atr_used_pct) else np.nan
+
+    vwap_state = "N/A" if pd.isna(vwap) else ("ABOVE VWAP" if c > vwap else ("BELOW VWAP" if c < vwap else "AT VWAP"))
+    if c > orb_high:
+        first15_state = "HIGH BREAK"
+    elif c < orb_low:
+        first15_state = "LOW BREAK"
+    else:
+        first15_state = "INSIDE 15m"
+
+    poc, vah, val = vp["poc"], vp["vah"], vp["val"]
+    if pd.isna(poc):
+        vp_state = "N/A"
+    elif pd.notna(vah) and c > vah:
+        vp_state = "ABOVE VAH"
+    elif pd.notna(val) and c < val:
+        vp_state = "BELOW VAL"
+    elif c >= poc:
+        vp_state = "ABOVE POC"
+    else:
+        vp_state = "BELOW POC"
+
+    bull = 0
+    bear = 0
+    if c > cpr_high: bull += 1
+    elif c < cpr_low: bear += 1
+    if c > levels["fib_r1"]: bull += 1
+    elif c < levels["fib_s1"]: bear += 1
+    if pd.notna(atr_used_pct) and atr_used_pct < 90:
+        if c >= o: bull += 1
+        elif c < o: bear += 1
+    if vwap_state == "ABOVE VWAP": bull += 1
+    elif vwap_state == "BELOW VWAP": bear += 1
+    if first15_state == "HIGH BREAK": bull += 1
+    elif first15_state == "LOW BREAK": bear += 1
+    if vp_state in ("ABOVE VAH", "ABOVE POC"): bull += 1
+    elif vp_state in ("BELOW VAL", "BELOW POC"): bear += 1
+
+    strength = max(bull, bear) / 6.0 * 100.0
+    final_view = "🟢 BULLISH" if bull > bear else ("🔴 BEARISH" if bear > bull else "🟡 MIXED")
+
+    important = (
+        f'CPR {cpr_low:.2f}-{cpr_high:.2f} | '
+        f'R1 {levels["fib_r1"]:.2f} / S1 {levels["fib_s1"]:.2f} | '
+        f'VWAP {vwap:.2f}' if pd.notna(vwap) else
+        f'CPR {cpr_low:.2f}-{cpr_high:.2f} | R1 {levels["fib_r1"]:.2f} / S1 {levels["fib_s1"]:.2f}'
+    )
+    important += f' | 15m H/L {orb_high:.2f}/{orb_low:.2f}'
+    if pd.notna(poc):
+        important += f' | Approx POC/VAH/VAL {poc:.2f}/{vah:.2f}/{val:.2f}'
+
+    return {
+        "Symbol": symbol,
+        "Close": c,
+        "CPR": cpr_state,
+        "CPR Dist %": cpr_dist_pct,
+        "Elastic": elastic,
+        "Fib R1/S1": fib_state,
+        "ATR Used %": atr_used_pct,
+        "ATR Space %": atr_space_pct,
+        "VWAP": vwap_state,
+        "First 15m": first15_state,
+        "Approx VP": vp_state,
+        "Bull Score": bull,
+        "Bear Score": bear,
+        "Strength %": strength,
+        "Final View": final_view,
+        "Important Levels": important,
+    }
+
+
+def build_confluence_table(symbols, data_map):
+    rows = []
+    for symbol in symbols:
+        raw = data_map.get(symbol)
+        try:
+            row = build_confluence_row(symbol, raw)
+            if row:
+                rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_nifty_option_chain_raw():
+    """Existing nsepython source only. Failure returns None and never breaks Tabs 1-10."""
+    if nse_optionchain_scrapper is None:
+        return None
+    try:
+        oc = nse_optionchain_scrapper("NIFTY")
+        return oc if isinstance(oc, dict) else None
+    except Exception:
+        return None
+
+
+def option_chain_expiries(oc):
+    if not isinstance(oc, dict):
+        return []
+    records = oc.get("records") or {}
+    exps = records.get("expiryDates") or []
+    if exps:
+        return [str(x) for x in exps if x]
+
+    # Fallback: derive expiry list from records.data.
+    seen = []
+    for item in records.get("data") or []:
+        exp = item.get("expiryDate")
+        if exp and str(exp) not in seen:
+            seen.append(str(exp))
+    return seen
+
+
+def _infer_strike_step(strikes, atm_hint):
+    vals = sorted(set(float(s) for s in strikes if pd.notna(s)))
+    if len(vals) < 2:
+        return 50.0
+    diffs = [b-a for a,b in zip(vals[:-1], vals[1:]) if b-a > 0]
+    if not diffs:
+        return 50.0
+    # Most common practical gap around listed strikes.
+    rounded = [round(d, 6) for d in diffs]
+    return float(pd.Series(rounded).mode().iloc[0])
+
+
+def five_strike_pcr_snapshot(oc, expiry):
+    """Dynamic selected-expiry basket: current ATM ±2 listed strikes."""
+    if not isinstance(oc, dict):
+        return None
+    records = oc.get("records") or {}
+    data = records.get("data") or []
+    if not data:
+        return None
+
+    filtered = [d for d in data if str(d.get("expiryDate", "")) == str(expiry)]
+    if not filtered:
+        return None
+
+    underlying = _safe_float(records.get("underlyingValue"))
+    strikes = sorted(set(_safe_float(d.get("strikePrice")) for d in filtered))
+    strikes = [s for s in strikes if pd.notna(s)]
+    if not strikes:
+        return None
+
+    if pd.isna(underlying):
+        underlying = float(np.median(strikes))
+
+    step = _infer_strike_step(strikes, underlying)
+    atm = min(strikes, key=lambda s: abs(s-underlying))
+
+    # Pick the two actual listed strikes below and above ATM; no manual strike codes.
+    below = [s for s in strikes if s < atm]
+    above = [s for s in strikes if s > atm]
+    basket = below[-2:] + [atm] + above[:2]
+    if len(basket) < 5:
+        # Fallback to nearest 5 listed strikes if edge case.
+        basket = sorted(sorted(strikes, key=lambda s: abs(s-atm))[:5])
+
+    ce_oi = 0.0
+    pe_oi = 0.0
+    ce_chg = 0.0
+    pe_chg = 0.0
+
+    by_strike = {float(d.get("strikePrice")): d for d in filtered if d.get("strikePrice") is not None}
+    for strike in basket:
+        item = by_strike.get(float(strike), {})
+        ce = item.get("CE") or {}
+        pe = item.get("PE") or {}
+        ce_oi += _safe_float(ce.get("openInterest"), 0.0)
+        pe_oi += _safe_float(pe.get("openInterest"), 0.0)
+        ce_chg += _safe_float(ce.get("changeinOpenInterest"), 0.0)
+        pe_chg += _safe_float(pe.get("changeinOpenInterest"), 0.0)
+
+    pcr = pe_oi / ce_oi if ce_oi > 0 else np.nan
+    doi_pcr = pe_chg / ce_chg if ce_chg != 0 else np.nan
+
+    return {
+        "expiry": str(expiry),
+        "underlying": underlying,
+        "atm": float(atm),
+        "step": float(step),
+        "basket": basket,
+        "call_oi": ce_oi,
+        "put_oi": pe_oi,
+        "pcr": pcr,
+        "call_doi": ce_chg,
+        "put_doi": pe_chg,
+        "doi_pcr": doi_pcr,
+    }
+
+
+def _nifty_live_vwap_from_map(data_map):
+    raw = data_map.get("NIFTY")
+    if raw is None or raw.empty:
+        return np.nan
+    try:
+        x = enrich(raw)
+        d = latest_session(x)
+        return _safe_float(d["vwap"].iloc[-1]) if not d.empty else np.nan
+    except Exception:
+        return np.nan
+
+
+def heavyweight_table(nifty_df):
+    cols = ["Rank", "Stock", "Weight %", "Price %", "VWAP", "RVOL", "Momentum", "Trend", "Weighted Impact", "Final Strength"]
+    if nifty_df is None or nifty_df.empty:
+        return pd.DataFrame(columns=cols), "N/A", np.nan, 0, 0
+
+    rows = []
+    for sym, weight in sorted(NIFTY_TOP10_WEIGHT_SNAPSHOT.items(), key=lambda kv: kv[1], reverse=True):
+        m = nifty_df[nifty_df["Symbol"] == sym]
+        if m.empty:
+            continue
+        r = m.iloc[0]
+        chg = _safe_float(r.get("Change %"), 0.0)
+        rvol = _safe_float(r.get("RVOL"))
+        vwap_bias = str(r.get("VWAP Bias", "N/A"))
+        mtf = str(r.get("MTF Alignment", "N/A"))
+        trend_strength = _safe_float(r.get("Trend Strength %"), 0.0)
+
+        bull = 0
+        bear = 0
+        if chg > 0: bull += 1
+        elif chg < 0: bear += 1
+        if vwap_bias == "BULLISH": bull += 1
+        elif vwap_bias == "BEARISH": bear += 1
+        if "BULLISH" in mtf: bull += 1
+        elif "BEARISH" in mtf: bear += 1
+        if trend_strength > 0: bull += 1
+        elif trend_strength < 0: bear += 1
+
+        final = "🟢 BULLISH" if bull > bear else ("🔴 BEARISH" if bear > bull else "🟡 MIXED")
+        direction = 1 if bull > bear else (-1 if bear > bull else 0)
+        impact = float(weight) * direction
+        momentum = "UP" if chg > 0 else ("DOWN" if chg < 0 else "FLAT")
+        trend = "BULL" if trend_strength > 0 else ("BEAR" if trend_strength < 0 else "FLAT")
+
+        rows.append({
+            "Stock": sym,
+            "Weight %": float(weight),
+            "Price %": chg,
+            "VWAP": vwap_bias,
+            "RVOL": rvol,
+            "Momentum": momentum,
+            "Trend": trend,
+            "Weighted Impact": impact,
+            "Final Strength": final,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=cols), "N/A", np.nan, 0, 0
+
+    df = pd.DataFrame(rows).sort_values("Weight %", ascending=False).reset_index(drop=True)
+    df.insert(0, "Rank", np.arange(1, len(df)+1))
+    total_weight = float(df["Weight %"].sum())
+    net_impact = float(df["Weighted Impact"].sum())
+    weighted_pct = (net_impact / total_weight * 100.0) if total_weight > 0 else np.nan
+    bulls = int(df["Final Strength"].str.contains("BULLISH", regex=False).sum())
+    bears = int(df["Final Strength"].str.contains("BEARISH", regex=False).sum())
+    summary = "🟢 BULLISH" if net_impact > 0 else ("🔴 BEARISH" if net_impact < 0 else "🟡 MIXED")
+    return df, summary, weighted_pct, bulls, bears
+
+
+def pcr_context_label(pcr):
+    """Neutral analytical context only; not an order/execution instruction."""
+    if pd.isna(pcr):
+        return "N/A"
+    if pcr >= 1.10:
+        return "PUT OI HEAVY"
+    if pcr <= 0.80:
+        return "CALL OI HEAVY"
+    return "BALANCED"
+
+
+def append_pcr_history(snapshot, fut_quote, vwap_value):
+    if snapshot is None:
+        return
+
+    now = pd.Timestamp.now(tz=IST)
+    key = "tab12_pcr_history"
+    last_key = "tab12_pcr_last_stamp"
+    hist = st.session_state.get(key, [])
+    last_meta = st.session_state.get(last_key, {})
+
+    changed = (
+        last_meta.get("atm") != snapshot["atm"]
+        or last_meta.get("expiry") != snapshot["expiry"]
+    )
+    last_time = last_meta.get("time")
+    due = last_time is None or (now - last_time).total_seconds() >= 180
+
+    if not (changed or due):
+        return
+
+    fut_price = np.nan
+    if isinstance(fut_quote, dict):
+        fut_price = _safe_float(fut_quote.get("price"))
+
+    if pd.notna(fut_price) and pd.notna(vwap_value):
+        vwap_signal = "FUT ABOVE VWAP" if fut_price > vwap_value else ("FUT BELOW VWAP" if fut_price < vwap_value else "AT VWAP")
+    else:
+        vwap_signal = "N/A"
+
+    option_ctx = pcr_context_label(snapshot["pcr"])
+    if option_ctx == "PUT OI HEAVY" and vwap_signal == "FUT ABOVE VWAP":
+        combined = "BULLISH CONTEXT"
+    elif option_ctx == "CALL OI HEAVY" and vwap_signal == "FUT BELOW VWAP":
+        combined = "BEARISH CONTEXT"
+    else:
+        combined = "HOLD / MIXED"
+
+    hist.insert(0, {
+        "Time": now.strftime("%H:%M"),
+        "Expiry": snapshot["expiry"],
+        "ATM": snapshot["atm"],
+        "5 Strikes": ", ".join(str(int(x) if float(x).is_integer() else x) for x in snapshot["basket"]),
+        "Call OI": snapshot["call_oi"],
+        "Put OI": snapshot["put_oi"],
+        "PCR": snapshot["pcr"],
+        "Option Context": option_ctx,
+        "VWAP": vwap_value,
+        "Nifty FUT": fut_price,
+        "VWAP Context": vwap_signal,
+        "Combined Context": combined,
+    })
+
+    st.session_state[key] = hist[:120]
+    st.session_state[last_key] = {"time": now, "atm": snapshot["atm"], "expiry": snapshot["expiry"]}
+
+
 # =============================================================================
 # SIDEBAR
 # =============================================================================
-st.title("📈 NSE Fast Scanner — 10 Tabs")
+st.title("📈 NSE Fast Scanner — 12 Tabs")
 
 with st.sidebar:
     st.header("Scanner Settings")
@@ -798,6 +1308,8 @@ tabs = st.tabs([
     "8️⃣ NIFTY50 Breadth",
     "9️⃣ MTF + Score",
     "🔟 Sector Heatmap",
+    "1️⃣1️⃣ 15m Confluence",
+    "1️⃣2️⃣ Heavyweights + PCR",
 ])
 
 # -----------------------------------------------------------------------------
@@ -1013,6 +1525,159 @@ with tabs[9]:
             else: bg,cls="rgba(150,150,150,.10)","neu"
             cards.append(f'<div class="sector-card" style="background:{bg}"><div class="sector-name">{sector}</div><div class="sector-pct {cls}">{avg:+.2f}%</div><div class="sector-stocks">{stocks}</div></div>')
         st.markdown('<div class="sector-grid">'+''.join(cards)+'</div>',unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# TAB 11 — 15m CONFLUENCE MATRIX
+# -----------------------------------------------------------------------------
+with tabs[10]:
+    st.subheader("15-Minute Confluence Matrix")
+    st.caption(
+        "First 15m range + CPR + Fib R1/S1 + ATR space + VWAP + Approx Volume Profile. "
+        "Strength % is a confluence score, not a guaranteed probability."
+    )
+
+    # Uses the same already-loaded F&O intraday map. Existing Tabs 1-10 are not recalculated differently.
+    confluence_df = build_confluence_table(fo_symbols, data_map)
+
+    if confluence_df.empty:
+        st.info("15m confluence data abhi available nahi hai. First 15-minute range complete hone ke baad check karein.")
+    else:
+        display_cols = [
+            "Symbol", "Close", "CPR", "CPR Dist %", "Elastic", "Fib R1/S1",
+            "ATR Used %", "ATR Space %", "VWAP", "First 15m", "Approx VP",
+            "Bull Score", "Bear Score", "Strength %", "Final View", "Important Levels",
+        ]
+        cdf = confluence_df[display_cols].copy()
+        for col in ["Close", "CPR Dist %", "ATR Used %", "ATR Space %", "Strength %"]:
+            cdf[col] = pd.to_numeric(cdf[col], errors="coerce").round(2)
+
+        cdf = cdf.sort_values(["Strength %", "Bull Score", "Bear Score"], ascending=[False, False, False])
+
+        def confluence_paint(v):
+            s = str(v)
+            if "BULLISH" in s or "ABOVE" in s or "HIGH BREAK" in s:
+                return "background-color:rgba(0,180,90,.14);color:#008f4c;font-weight:700"
+            if "BEARISH" in s or "BELOW" in s or "LOW BREAK" in s:
+                return "background-color:rgba(220,60,60,.14);color:#c62828;font-weight:700"
+            if "MIXED" in s or "INSIDE" in s or "RETEST" in s:
+                return "background-color:rgba(230,190,0,.14);font-weight:700"
+            return ""
+
+        styled = cdf.style
+        for col in ["CPR", "Elastic", "Fib R1/S1", "VWAP", "First 15m", "Approx VP", "Final View"]:
+            styled = styled.map(confluence_paint, subset=[col])
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=720)
+
+    st.caption("Approx VP uses 5m bar typical-price volume because this free feed does not provide true tick-by-price volume distribution.")
+
+
+# -----------------------------------------------------------------------------
+# TAB 12 — TOP-10 HEAVYWEIGHTS + DYNAMIC EXPIRY 5-STRIKE PCR
+# -----------------------------------------------------------------------------
+with tabs[11]:
+    st.subheader("NIFTY Top-10 Heavyweight Strength + 5-Strike PCR")
+
+    heavy_df, heavy_summary, heavy_weighted_pct, heavy_bulls, heavy_bears = heavyweight_table(nifty_df)
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Top-10 Strength", heavy_summary)
+    h2.metric("Weighted Strength", "N/A" if pd.isna(heavy_weighted_pct) else f"{heavy_weighted_pct:+.1f}%")
+    h3.metric("Bullish Count", heavy_bulls)
+    h4.metric("Bearish Count", heavy_bears)
+
+    st.caption("Weight % fallback snapshot: official NSE Indices NIFTY 50 factsheet dated 29-May-2026. Prices/strength remain live from the scanner feed.")
+
+    if heavy_df.empty:
+        st.info("Top-10 heavyweight rows abhi load nahi hui.")
+    else:
+        hdf = heavy_df.copy()
+        for col in ["Weight %", "Price %", "RVOL", "Weighted Impact"]:
+            hdf[col] = pd.to_numeric(hdf[col], errors="coerce").round(2)
+
+        def heavy_paint(v):
+            s = str(v)
+            if "BULLISH" in s or s == "UP" or s == "BULL":
+                return "background-color:rgba(0,180,90,.14);color:#008f4c;font-weight:700"
+            if "BEARISH" in s or s == "DOWN" or s == "BEAR":
+                return "background-color:rgba(220,60,60,.14);color:#c62828;font-weight:700"
+            if "MIXED" in s:
+                return "background-color:rgba(230,190,0,.14);font-weight:700"
+            return ""
+
+        hstyled = hdf.style
+        for col in ["VWAP", "Momentum", "Trend", "Final Strength"]:
+            hstyled = hstyled.map(heavy_paint, subset=[col])
+        st.dataframe(hstyled, use_container_width=True, hide_index=True, height=440)
+
+    st.markdown("### Dynamic Expiry — Current ATM ±2 = 5 Strikes")
+    oc12 = fetch_nifty_option_chain_raw()
+    expiries12 = option_chain_expiries(oc12)
+
+    if not expiries12:
+        st.warning("NIFTY option-chain / expiry list abhi unavailable hai. Tabs 1-10 aur heavyweight panel normal chalenge.")
+    else:
+        selected_expiry12 = st.selectbox(
+            "NIFTY Expiry",
+            expiries12,
+            index=0,
+            key="tab12_expiry_select",
+            help="Available expiries option-chain se dynamically read hoti hain. Current/next expiry yahan select kar sakte hain.",
+        )
+
+        snap12 = five_strike_pcr_snapshot(oc12, selected_expiry12)
+        if snap12 is None:
+            st.warning("Selected expiry ka 5-strike basket abhi build nahi ho saka.")
+        else:
+            btxt = " | ".join(str(int(x) if float(x).is_integer() else x) for x in snap12["basket"])
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("ATM", f'{snap12["atm"]:,.0f}')
+            p2.metric("5-Strike PCR", "N/A" if pd.isna(snap12["pcr"]) else f'{snap12["pcr"]:.2f}')
+            p3.metric("Call OI (5)", f'{snap12["call_oi"]:,.0f}')
+            p4.metric("Put OI (5)", f'{snap12["put_oi"]:,.0f}')
+            st.caption(f'Expiry: {snap12["expiry"]} | Dynamic Basket: {btxt} | Step detected: {snap12["step"]:g}')
+
+            # The scanner does not contain a truthful NIFTY index intraday series in data_map,
+            # so use current NIFTY quote as a price reference; FUT remains the existing fut_quote.
+            nifty_ref = _safe_float(nifty_quote.get("price")) if isinstance(nifty_quote, dict) else np.nan
+            # Existing scanner has no NIFTY index VWAP series. Keep N/A instead of inventing one.
+            nifty_vwap12 = np.nan
+            append_pcr_history(snap12, fut_quote, nifty_vwap12)
+
+            hist12 = pd.DataFrame(st.session_state.get("tab12_pcr_history", []))
+            if hist12.empty:
+                st.info("PCR history first snapshot ka wait kar rahi hai.")
+            else:
+                for col in ["ATM", "Call OI", "Put OI", "PCR", "VWAP", "Nifty FUT"]:
+                    if col in hist12.columns:
+                        hist12[col] = pd.to_numeric(hist12[col], errors="coerce")
+                for col in ["ATM", "Call OI", "Put OI"]:
+                    if col in hist12.columns:
+                        hist12[col] = hist12[col].round(0)
+                for col in ["PCR", "VWAP", "Nifty FUT"]:
+                    if col in hist12.columns:
+                        hist12[col] = hist12[col].round(2)
+
+                def pcr_paint(v):
+                    s = str(v)
+                    if "BULLISH" in s or "PUT OI HEAVY" in s or "ABOVE" in s:
+                        return "background-color:rgba(0,180,90,.14);color:#008f4c;font-weight:700"
+                    if "BEARISH" in s or "CALL OI HEAVY" in s or "BELOW" in s:
+                        return "background-color:rgba(220,60,60,.14);color:#c62828;font-weight:700"
+                    if "HOLD" in s or "BALANCED" in s:
+                        return "background-color:rgba(230,190,0,.14);font-weight:700"
+                    return ""
+
+                pstyled = hist12.style
+                for col in ["Option Context", "VWAP Context", "Combined Context"]:
+                    if col in hist12.columns:
+                        pstyled = pstyled.map(pcr_paint, subset=[col])
+                st.dataframe(pstyled, use_container_width=True, hide_index=True, height=520)
+
+            st.caption(
+                "History refresh: approx. every 3 minutes, and immediately when ATM or selected expiry changes. "
+                "Old rows keep the ATM/expiry basket that existed at that timestamp."
+            )
 
 # =============================================================================
 # FOOTER
