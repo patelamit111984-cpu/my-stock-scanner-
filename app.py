@@ -905,14 +905,68 @@ def build_confluence_table(symbols, data_map):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_nifty_option_chain_raw():
-    """Existing nsepython source only. Failure returns None and never breaks Tabs 1-10."""
-    if nse_optionchain_scrapper is None:
-        return None
+    """
+    NIFTY option-chain source for Tab 12 only.
+
+    1) Keep the scanner's existing nsepython source first.
+    2) If it fails, try NSE's public web JSON endpoint with a normal requests.Session.
+    3) Any failure returns None, so Tabs 1-11 continue normally.
+
+    No synthetic option-chain/PCR data is created.
+    """
+    # Existing source first — preserves the old scanner behaviour.
+    if nse_optionchain_scrapper is not None:
+        try:
+            oc = nse_optionchain_scrapper("NIFTY")
+            if isinstance(oc, dict) and (oc.get("records") or {}).get("data"):
+                return oc
+        except Exception:
+            pass
+
+    # Direct NSE fallback. Uses only requests, already present in requirements.txt.
     try:
-        oc = nse_optionchain_scrapper("NIFTY")
-        return oc if isinstance(oc, dict) else None
-    except Exception:
-        return None
+        session = requests.Session()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/option-chain",
+            "Connection": "keep-alive",
+        }
+
+        # Establish a normal NSE web session first.
+        home = session.get(
+            "https://www.nseindia.com/",
+            headers=headers,
+            timeout=8,
+        )
+        if home.status_code >= 400:
+            return None
+
+        response = session.get(
+            "https://www.nseindia.com/api/option-chain-indices",
+            params={"symbol": "NIFTY"},
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+
+        content_type = str(response.headers.get("content-type", "")).lower()
+        if "json" not in content_type:
+            return None
+
+        oc = response.json()
+        if isinstance(oc, dict) and (oc.get("records") or {}).get("data"):
+            return oc
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
+    return None
 
 
 def option_chain_expiries(oc):
@@ -1685,6 +1739,6 @@ with tabs[11]:
 st.caption(
     "Free stock/NIFTY data layer: Yahoo Finance (may be delayed). "
     "GIFT NIFTY is best-effort from a third-party public page and may show N/A if blocked. "
-    "PCR is shown only when actual NSE option-chain OI is available through nsepython; no synthetic PCR is invented. "
+    "PCR is shown only when actual NSE option-chain OI is available through nsepython or the direct NSE web JSON fallback; no synthetic PCR is invented. "
     "Old scanner formulas are preserved; new modules are add-ons."
 )
